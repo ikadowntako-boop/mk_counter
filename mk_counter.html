@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>MK Lounge 集計機</title>
+<style>
+  body{font-family:sans-serif;margin:16px;}
+  table{border-collapse:collapse;}
+  th,td{border:1px solid #ccc;padding:4px 8px;text-align:center;}
+  .left{text-align:left;}
+  .dup{background:#fdd;}
+  .muted{color:#666;font-size:12px;}
+  .scroll-wrap{overflow:auto;}
+  .result-row{display:flex;justify-content:space-between;margin-bottom:4px;}
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>MK Lounge 集計機（12人固定・12レース）</h1>
+  <div class="controls">
+    <div style="display:flex;align-items:center;gap:8px">
+      <button id="regen">表を生成</button>
+      <button id="clear">表の入力クリア</button>
+      <button id="resetTags">タグだけクリア</button>
+    </div>
+  </div>
+
+  <div class="muted">
+    操作: 左にチームタグ入力、右の順位表に数字キーで順位を入力。<br>
+    Enterで次プレイヤー・最下行で次のレースに移動。重複は赤背景で警告。<br>
+    Backspaceで前セルに移動（Player12→Player1→次列）、Deleteでセル削除。
+  </div>
+
+  <div class="scroll-wrap" style="display:flex;gap:16px;">
+    <!-- 左カラム：チームタグ -->
+    <div id="teamColumn" style="flex-shrink:0;">
+      <table id="teamTable">
+        <thead><tr><th>番号</th><th>チームタグ</th></tr></thead>
+        <tbody id="teamBody"></tbody>
+      </table>
+    </div>
+
+    <!-- 右カラム：順位表 -->
+    <div id="rankColumn" style="overflow-x:auto;">
+      <table id="mainTable">
+        <thead id="thead"></thead>
+        <tbody id="tbody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="results">
+    <h2 style="font-size:16px;margin:8px 0">集計結果（合計のみ）</h2>
+    <div id="resultsList" aria-live="polite"></div>
+    <div class="actions">
+      <button id="copyTotals" class="small">合計だけをコピー</button>
+      <button id="exportCsv" class="small">CSVダウンロード（全セル）</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const RACES = 12;
+const PLAYERS = 12;
+const points12 = {1:15,2:12,3:10,4:9,5:8,6:7,7:6,8:5,9:4,10:3,11:2,12:1};
+
+const regenBtn = document.getElementById('regen');
+const clearBtn = document.getElementById('clear');
+const resetTagsBtn = document.getElementById('resetTags');
+const thead = document.getElementById('thead');
+const tbody = document.getElementById('tbody');
+const teamBody = document.getElementById('teamBody');
+const resultsList = document.getElementById('resultsList');
+const copyTotalsBtn = document.getElementById('copyTotals');
+const exportCsvBtn = document.getElementById('exportCsv');
+
+function createTable(){
+  teamBody.innerHTML='';
+  for(let i=1;i<=PLAYERS;i++){
+    const tr = document.createElement('tr');
+    tr.innerHTML=`<td>Player${i}</td><td><input class="teamTag team-input" placeholder="例:A" /></td>`;
+    teamBody.appendChild(tr);
+  }
+
+  thead.innerHTML='';
+  const trHead = document.createElement('tr');
+  trHead.innerHTML='<th class="left">番号</th>';
+  for(let r=1;r<=RACES;r++) trHead.innerHTML+=`<th>R${r}</th>`;
+  trHead.innerHTML+='<th>合計</th>';
+  thead.appendChild(trHead);
+
+  tbody.innerHTML='';
+  for(let i=1;i<=PLAYERS;i++){
+    const tr = document.createElement('tr');
+    let html = `<td>Player${i}</td>`;
+    for(let r=1;r<=RACES;r++){
+      html+=`<td><input class="rankInput" type="number" min="1" max="${PLAYERS}" /></td>`;
+    }
+    html+=`<td class="totalCell">0</td>`;
+    tr.innerHTML=html;
+    tbody.appendChild(tr);
+  }
+
+  attachInputHandlers();
+  computeAll();
+}
+
+function attachInputHandlers(){
+  const rankInputs = Array.from(document.querySelectorAll('.rankInput'));
+  rankInputs.forEach((inp)=>{
+    inp.addEventListener('keydown', onRankKeyDown);
+    inp.addEventListener('input', computeAll);
+  });
+  document.querySelectorAll('.teamTag').forEach(ti=>ti.addEventListener('input', computeAll));
+}
+
+function onRankKeyDown(e){
+  const el = e.target;
+  if(!el.classList.contains('rankInput')) return;
+
+  const inputs = Array.from(document.querySelectorAll('.rankInput'));
+  const idx = inputs.indexOf(el);
+  const row = Math.floor(idx / RACES);
+  const col = idx % RACES;
+
+  if(e.key==='Enter'){
+    e.preventDefault();
+    let nextRow = row+1, nextCol = col;
+    if(nextRow>=PLAYERS){ nextRow=0; nextCol=col+1; if(nextCol>=RACES){ nextCol=col; nextRow=row; } }
+    inputs[nextRow*RACES+nextCol].focus();
+  }
+
+  // Backspace: 前セルに移動（列優先→行逆順）
+  if(e.key==='Backspace'){
+    e.preventDefault();
+    let prevRow = row-1;
+    let prevCol = col;
+    if(prevRow<0){ prevRow=PLAYERS-1; prevCol=col-1; if(prevCol<0) prevCol=0; }
+    inputs[prevRow*RACES+prevCol].focus();
+  }
+
+  // Delete: 現セル削除
+  if(e.key==='Delete'){ e.preventDefault(); el.value=''; computeAll(); }
+}
+
+function getPointForRank(r){ r=Number(r); return points12[r]||0; }
+
+function computeAll(){
+  const rows = Array.from(tbody.querySelectorAll('tr'));
+  // 重複チェック
+  for(let c=0;c<RACES;c++){
+    const colVals={};
+    rows.forEach(row=>{
+      const inp = row.querySelectorAll('.rankInput')[c];
+      const v = inp.value;
+      if(v!==''){ if(!colVals[v]) colVals[v]=[]; colVals[v].push(inp); }
+    });
+    Object.keys(colVals).forEach(k=>{
+      if(colVals[k].length>1) colVals[k].forEach(i=>i.classList.add('dup'));
+      else colVals[k].forEach(i=>i.classList.remove('dup'));
+    });
+  }
+
+  // プレイヤー集計
+  const playerTotals=[];
+  rows.forEach((row,rIdx)=>{
+    const tag = document.querySelectorAll('.teamTag')[rIdx].value.trim();
+    const rankInputs = Array.from(row.querySelectorAll('.rankInput'));
+    let sum=0; rankInputs.forEach(inp=>sum+=getPointForRank(inp.value));
+    row.querySelector('.totalCell').textContent=sum;
+    playerTotals.push({player:`Player${rIdx+1}`,tag,points:sum});
+  });
+
+  // チーム集計
+  const teamMap={};
+  playerTotals.forEach(p=>{
+    if(!p.tag) return;
+    if(!teamMap[p.tag]) teamMap[p.tag]={points:0,members:0};
+    teamMap[p.tag].points+=p.points;
+    teamMap[p.tag].members+=1;
+  });
+
+  const teams = Object.keys(teamMap).map(tag=>({tag,points:teamMap[tag].points,members:teamMap[tag].members}));
+  teams.sort((a,b)=>b.points-a.points || a.tag.localeCompare(b.tag));
+
+  const top = teams.length>0 ? teams[0].points : 0;
+  resultsList.innerHTML='';
+  if(teams.length===0){
+    resultsList.innerHTML='<div class="muted">チームタグを入力すると集計がここに表示されます。</div>';
+    return;
+  }
+  teams.forEach((t,idx)=>{
+    const diff = t.points-top; const sign = diff>=0?'+':'';
+    const div=document.createElement('div');
+    div.className='result-row';
+    div.innerHTML=`<div><strong>${idx===0?'🥇 ':''}${t.tag}</strong> <span class="muted">(members:${t.members})</span></div>
+      <div>${t.points}点 <span class="muted">(${sign}${diff})</span></div>`;
+    resultsList.appendChild(div);
+  });
+}
+
+// copy totals
+copyTotalsBtn.addEventListener('click', async ()=>{
+  const rows = Array.from(resultsList.querySelectorAll('.result-row'));
+  if(rows.length===0){ alert('コピーする結果がありません'); return; }
+  const lines = rows.map((r,idx)=>{
+    const tag = r.children[0].querySelector('strong').textContent.replace('🥇 ','');
+    const ptsText = r.children[1].textContent.trim();
+    const ptsMatch = ptsText.match(/(\d+)点.*\((.*)\)/);
+    const pts = ptsMatch?ptsMatch[1]:'0';
+    const diff = ptsMatch?ptsMatch[2]:'+0';
+    const ord = idx===0?'1st':idx===1?'2nd':idx===2?'3rd':`${idx+1}th`;
+    return `${ord} ${tag} ${pts} (${diff})`;
+  });
+  const text = lines.join('\n');
+  try{ await navigator.clipboard.writeText(text); alert('合計だけをコピーしました'); }
+  catch(e){ const ta=document.createElement('textarea'); ta.value=text; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); ta.remove(); alert('コピー（フォールバック）しました'); }
+});
+
+// CSV export
+exportCsvBtn.addEventListener('click', ()=>{
+  const rows = Array.from(tbody.querySelectorAll('tr'));
+  const headers=['player']; for(let r=1;r<=RACES;r++) headers.push('R'+r); headers.push('total');
+  const lines=[headers.join(',')];
+  rows.forEach((row,idx)=>{
+    const player=`Player${idx+1}`;
+    const ranks=Array.from(row.querySelectorAll('.rankInput')).map(i=>i.value||'');
+    const totalPts=row.querySelector('.totalCell').textContent;
+    lines.push([player,...ranks,totalPts].join(','));
+  });
+  const blob=new Blob([lines.join('\n')],{type:'text/csv'});
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement('a'); a.href=url; a.download='mk_lounge_full.csv'; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+});
+
+regenBtn.addEventListener('click', createTable);
+clearBtn.addEventListener('click', ()=>{
+  document.querySelectorAll('.teamTag').forEach(i=>i.value='');
+  document.querySelectorAll('.rankInput').forEach(i=>i.value='');
+  computeAll();
+});
+resetTagsBtn.addEventListener('click', ()=>{ document.querySelectorAll('.teamTag').forEach(i=>i.value=''); computeAll(); });
+
+// 初期生成
+createTable();
+</script>
+</body>
+</html>
